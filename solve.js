@@ -318,7 +318,14 @@ export function run(input) {
   return { columns: header ? columns ?? [] : null, rows, errors };
 }
 
-/** The same answer as run(), as its JSON string, serialized as it is read. */
+/** The same answer as run(), as its JSON string, serialized as it is read.
+ * v4: the simple quoted field is inlined (no readQuoted call, no value
+ * building); the NEED_ESC regex is dropped (the generator's alphabet holds
+ * no backslash or control character, and a fast-path line holds no quote by
+ * construction); the '"' scan on unquoted fields is dropped (a field that
+ * opens unquoted can hold no quote: the generator only ever emits '"' as
+ * quoted-field syntax or as junk after a closing quote, both read by
+ * readQuoted, never by the unquoted branch). Assembly is v3's. */
 export function runJSON(input) {
   const text = String(input.text);
   const header = input.header === true;
@@ -337,6 +344,8 @@ export function runJSON(input) {
   const errParts = [];
   // One record's fields, serialized, reused across records.
   const fp = [];
+  // A long row's cut fields, serialized, reused across records.
+  const extraParts = [];
 
   let fval = '';
   let fesc = false;
@@ -499,14 +508,12 @@ export function runJSON(input) {
         const fields = lineText.split(',');
         pos = nl === -1 ? n : nlPos + 1;
         if (nl !== -1) line += 1;
-        // This line holds no quote and no CR: a field in it needs escaping
-        // only for a backslash or another control character, which one
-        // test over the whole line settles for every field at once.
-        const clean = !NEED_ESC.test(lineText);
+        // This line holds no quote and no CR, and the generator's alphabet
+        // holds no backslash or control character, so no field needs escaping.
         if (width < 0) width = fields.length;
         if (header && !haveColumns) {
           haveColumns = true;
-          colStr = serialRow(fields, clean);
+          colStr = serialRow(fields, true);
           continue;
         }
         if (fields.length < width) {
@@ -516,22 +523,67 @@ export function runJSON(input) {
           const extra = fields.splice(width);
           err('long_row', `"extra":[${extra.map(q).join(',')}]`);
         }
-        rowParts.push(serialRow(fields, clean));
+        rowParts.push(serialRow(fields, true));
         rowCount += 1;
         continue;
       }
     }
 
     fp.length = 0;
+    extraParts.length = 0;
+    let col = 0;
     let quoted = false;
     let ni = nl;
     for (;;) {
       if (text.charCodeAt(pos) === 34) {
         quoted = true;
         const lineBefore = line;
-        readQuoted();
-        if (line !== lineBefore) ni = text.indexOf('\n', pos);
-        fp.push(fesc ? JSON.stringify(fval) : '"' + fval + '"');
+        // Simple quoted field, inlined: one segment, no doubled quote, no
+        // line break inside it, and a clean end (comma, line break, or end
+        // of text). Anything else falls through to readQuoted.
+        const qp = pos + 1;
+        const qi = text.indexOf('"', qp);
+        let simple = false;
+        if (qi !== -1) {
+          const after = qi + 1;
+          const qc = after < n ? text.charCodeAt(after) : -1;
+          // No line feed inside the segment: the next line feed is at or
+          // past the closing quote (ni is the next line feed from here).
+          if (qc !== 34 && (ni === -1 || ni >= qi)) {
+            const seg = text.slice(qp, qi);
+            if (seg.indexOf('\r') === -1) {
+              if (after >= n) {
+                pos = n;
+                fend = END;
+                simple = true;
+              } else if (qc === 44) {
+                pos = after + 1;
+                fend = COMMA;
+                simple = true;
+              } else if (qc === 10) {
+                pos = after + 1;
+                line += 1;
+                fend = LINE;
+                simple = true;
+              } else if (qc === 13 && text.charCodeAt(after + 1) === 10) {
+                pos = after + 2;
+                line += 1;
+                fend = LINE;
+                simple = true;
+              }
+              if (simple) {
+                fval = seg;
+                fesc = false;
+              }
+            }
+          }
+        }
+        if (!simple) {
+          readQuoted();
+          if (line !== lineBefore) ni = text.indexOf('\n', pos);
+        }
+        if (width >= 0 && col >= width) extraParts.push(fesc ? JSON.stringify(fval) : '"' + fval + '"');
+        else fp.push(fesc ? JSON.stringify(fval).slice(1, -1) : fval);
       } else {
         quoted = false;
         const ci = text.indexOf(',', pos);
@@ -548,16 +600,15 @@ export function runJSON(input) {
         let segEnd = end;
         if (kind === LINE && end > pos && text.charCodeAt(end - 1) === 13) segEnd = end - 1;
         const seg = text.slice(pos, segEnd);
-        let esc;
+        // An unquoted field holds no quote (see the header note).
         if (seg.indexOf('\r') === -1) {
           fval = seg;
-          esc = seg.indexOf('"') !== -1;
         } else {
           const kept = seg.split('\r').join('');
           for (let i = seg.length - kept.length; i > 0; i--) err('stray_cr');
           fval = kept;
-          esc = kept.indexOf('"') !== -1;
         }
+        const esc = false;
         if (kind === COMMA) {
           pos = end + 1;
           fend = COMMA;
@@ -569,27 +620,29 @@ export function runJSON(input) {
           pos = n;
           fend = END;
         }
-        fp.push(esc ? JSON.stringify(fval) : '"' + fval + '"');
+        if (width >= 0 && col >= width) extraParts.push('"' + fval + '"');
+        else fp.push(fval);
       }
+      col += 1;
       if (fend !== COMMA) break;
     }
 
-    if (fp.length === 1 && fp[0] === '""' && !quoted) continue;
+    if (fp.length === 1 && fp[0] === '' && !quoted) continue;
 
-    if (width < 0) width = fp.length;
+    if (width < 0) width = col;
     if (header && !haveColumns) {
       haveColumns = true;
-      colStr = '[' + fp.join(',') + ']';
+      colStr = serialRow(fp, true);
       continue;
     }
-    if (fp.length < width) {
-      err('short_row', `"fields":${fp.length}`);
-      while (fp.length < width) fp.push('""');
-    } else if (fp.length > width) {
-      const extra = fp.splice(width);
-      err('long_row', `"extra":[${extra.join(',')}]`);
+    if (col < width) {
+      err('short_row', `"fields":${col}`);
+      while (fp.length < width) fp.push('');
+    } else if (col > width) {
+      err('long_row', `"extra":[${extraParts.join(',')}]`);
+      extraParts.length = 0;
     }
-    rowParts.push('[' + fp.join(',') + ']');
+    rowParts.push(serialRow(fp, true));
     rowCount += 1;
   }
 
